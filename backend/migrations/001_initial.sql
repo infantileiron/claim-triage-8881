@@ -1,0 +1,5 @@
+-- Initial schema is created from SQLAlchemy metadata at backend startup.
+-- claims: code unique, label nullable (0 normal, 1 anomaly).
+-- trainings: frozen snapshot and holdout output JSON.
+-- reviews: training_id / claim_id foreign keys with unique source pair.
+-- Exact portable schema: src/models/entities.py.
