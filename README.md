@@ -1,6 +1,6 @@
 # 禾序 · 报销异常分类复核
 
-财务共享组把历史人工复核标签训练成可解释的逻辑回归版本，再按异常概率排定待核票据；最终判断和签核由人员完成。原生 HTML/CSS/JS 四个业务页面：样本池、训练配置、分类评估、风险复核。
+财务共享组把历史人工复核标签训练成可解释的逻辑回归版本，再按异常概率排定待核票据；最终判断和签核由人员完成。原生 HTML/CSS/JS 五个业务页面：样本池、训练配置、分类评估、风险复核、范围分流。
 
 ## 真实模拟场景
 
@@ -22,6 +22,8 @@
 6. 09:40 生成当前版本高风险待标注样本的复核任务，重复生成不会重复添加。
 7. 10:00 analyst 复核原票据并填“核验正常”或“需进一步核实”及理由。
 8. 10:10 admin 签核人工结论；10:20 viewer 下载 `claim-triage-<版本ID>.json` 留档。
+9. 10:30 对只能给范围的 `HX-RANGE-01` 录入金额/里程上下界，系统按最新版本给出概率上下界并分带：跨阈值进“范围分流”页的补证队列。
+10. 10:40 补证侧录入新凭证（更窄范围），旧评分失效、按新范围重算；未领取任务作废重派，已领取的复核沿用原凭据。analyst 在分流页领取任务、填写结果，失败任务可重试，同票不会被两边重复领走。
 
 ## 算法与口径
 
@@ -30,6 +32,16 @@
 已标注样本至少40笔且每类至少10笔，按标签分层分成75%训练/25%留出（seed=3106）。StandardScaler **只在训练集拟合**；Pipeline 后接 L2 LogisticRegression（C=1，max_iter=1000）。概率为 sigmoid(w·标准化特征+b)，阈值以上预测异常。Precision=TP/(TP+FP)，Recall=TP/(TP+FN)，F1=2PR/(P+R)，分母为零时指标为0。混淆矩阵合计等于留出集样本量。每个版本保留完整输入快照、训练/测试编号、训练集标准化均值、系数、留出概率与待标注概率、sha256 checksum。
 
 阈值敏感度在同一留出集计算。反复选择阈值后，该集合不能继续当成最终独立验收集。本项目用于小规模业务演示，不包含额外生产验收集。标准化系数可解释模型关联，不作为因果结论。类别不足会以 failed 状态保存明确错误；重复编号返回409，无效金额/标签返回422。输入修订后须新建训练版本，旧快照不变。任务只对其快照里的待标注样本评分，不提供模型在线部署端点。评分仅排定人工复核顺序。
+
+## 范围票据与概率上下界分流
+
+部分报销的金额、里程暂时只能给范围。票据录入金额/里程上下界（点值票据上下界相等），新凭证单独落 `evidences`，有效范围=原录入范围与全部凭证范围逐维取交集；交集为空直接拒绝（409），旧评分保持有效。
+
+异常概率用**最新已完成训练版本**的同一组标准化参数与逻辑回归系数计算，不重新训练。线性预测子 `g(a,d)=c0·a+c2·d+c3·a/(d+1)+c4` 对金额 `a` 为线性，对里程 `d` 的极值只出现在边界或驻点 `d*=sqrt(c3·a/c2)-1`，在范围矩形上解析枚举求得 `g` 的最小/最大值，再经 sigmoid 得到概率下界 `p_min` 与上界 `p_max`（点范围两者相等，且与模型 `predict_proba` 完全一致）。
+
+按训练阈值分三带并分流：`above`（`p_min≥阈值`，确定高风险）送复核任务；`cross`（区间跨越阈值）先派补证任务收窄范围；`below`（`p_max<阈值`）暂不派单，只留评分。评分依据 `basis` 冻结训练版本、阈值、有效范围、用到的凭证编号、极值点与判定理由，页面可展开查看。
+
+新凭证到达或范围修订后：旧评分立即置为失效并生成递增版本号，未着手（queued/failed）的任务作废旧按新评分重新分流；**已领取（claimed）的复核可沿原凭据继续，不被取消**。worker 在每个训练版本完成后也会按新版本全量重算。并发上，每票的评分与任务各有 `active+active_key` 唯一约束（同票至多一条当前评分、一条活动任务），领取用条件 UPDATE 原子完成（`WHERE state='queued'`），同票补证/领取再以 Redis 锁串行化，失败重试基于当前评分重新派单且不重复建单。
 
 ## 快速启动
 
@@ -55,7 +67,7 @@ docker compose up -d --build
 | 异步 | Redis列表队列、独立Python worker与心跳 |
 | 数据 | MySQL8.0、Redis7；Nginx反代 `/api/` 去前缀 |
 
-`frontend/src` 下 api/stores/types/components/common/hooks/pages/router/utils/constants 分离网络、状态、契约、组件、表单、页面和枚举。`backend/src` 下 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分离HTTP、查询、算法、持久化、校验、授权和配置。`backend/scripts/seed_demo.py` 用自然键只插入缺失账号/报销，不覆盖人工修订。`backend/migrations/001_initial.sql` 记录初始架构，实际初始DDL由SQLAlchemy metadata建立。
+`frontend/src` 下 api/stores/types/components/common/hooks/pages/router/utils/constants 分离网络、状态、契约、组件、表单、页面和枚举。`backend/src` 下 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分离HTTP、查询、算法、持久化、校验、授权和配置。`backend/scripts/seed_demo.py` 用自然键只插入缺失账号/报销，不覆盖人工修订。`backend/migrations/001_initial.sql` 记录初始架构，实际初始DDL由SQLAlchemy metadata建立，旧库由启动时 `_migrate` 幂等补齐范围分流列与 `evidences/scores/triage_tasks` 表。范围概率界与分流逻辑在 `services/analysis.py`（解析极值）和 `services/triage.py`（评分版本、派单、领取、补证重算、按票锁）。
 
 共享枚举 ROLES/STATES/DECISIONS/LABELS 位于后端 `backend/src/constants/enums.py` 和前端 `frontend/src/constants/enums.js`；Pydantic枚举校验位于 `backend/src/schemas/business.py`，权限检查位于 `backend/src/middlewares/auth.py`。状态徽章/表格/表单字段为共享组件，两种中间件提供request ID和安全响应头；全局异常处理与审计记录横切业务。
 
@@ -65,6 +77,6 @@ docker compose up -d --build
 
 ## 已知范围
 
-逐条表单/API录入和完整字段修订；无CSV/Excel导入、删除、分页或外部审批通知。原始seed为确定性模拟数据，不能推断真实风险。风险复核任务不自动回写训练标签；须人工在样本页确认标签后重新训练。Google Fonts联网加载，离线字体回退。测试、截图和报告在源码外 `test-artifacts/gb-3106/`。
+逐条表单/API录入和完整字段修订；无CSV/Excel导入、删除、分页或外部审批通知。原始seed为确定性模拟数据，不能推断真实风险。风险复核任务不自动回写训练标签；须人工在样本页确认标签后重新训练。范围概率界基于已冻结的逻辑回归在金额/里程矩形上解析求极值，未对节假日之外的分类变量、相关性或测量误差建模；范围始终基于业务录入与凭证交集，不做概率分布假设。Redis 锁在 Redis 不可用时降级为单进程串行（演示为单 worker，多 worker exactly-once 不在承诺范围）。Google Fonts联网加载，离线字体回退。测试、截图和报告在源码外 `test-artifacts/gb-3106/`。
 
 License：MIT，见 LICENSE。

@@ -3,11 +3,13 @@ import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
-from src.models.entities import User,Claim,Training,Review,Audit
-from src.schemas.business import Login,ClaimInput,TrainingInput,ReviewInput
+from src.models.entities import User,Claim,Training,Review,Audit,Evidence,Score,TriageTask
+from src.schemas.business import Login,ClaimInput,TrainingInput,ReviewInput,EvidenceInput,CompleteInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
+from src.services import triage
+from src.services.triage import TriageError,claim_lock,rescore_and_route,add_evidence,claim_task,complete_task,retry_task
 from src.controllers.business import ensure_training
 router=APIRouter()
 @router.post('/auth/login')
@@ -19,20 +21,35 @@ def login(data:Login,s=Depends(db)):
 def me(u=Depends(current)):return dump(u)
 @router.get('/claims')
 def claims(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Claim).order_by(Claim.id).all()]
+def _apply_ranges(r,data):
+ d=data.model_dump()
+ for k,v in d.items():setattr(r,k,v)
+ # 点值字段取范围中点，兼容既有训练快照与评分
+ r.amount=(data.amount_min+data.amount_max)/2
+ r.distance=(data.distance_min+data.distance_max)/2
+ return r
 @router.post('/claims')
 def create_claim(data:ClaimInput,u=Depends(editor),s=Depends(db)):
- r=Claim(**data.model_dump());s.add(r)
+ r=Claim(**data.model_dump());_apply_ranges(r,data);s.add(r)
  try:s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'报销编号重复')
- audit(s,u,'录入报销 '+r.code);return dump(r)
+ s.refresh(r)
+ with claim_lock(r.id):
+  score,task=rescore_and_route(s,r);s.commit()
+ routed=(task.kind+'/'+task.state) if task else 'below/暂不派单'
+ audit(s,u,f'录入报销 {r.code}（范围金额 {r.amount_min:.2f}~{r.amount_max:.2f}，里程 {r.distance_min:.1f}~{r.distance_max:.1f}），分流 {routed}')
+ return dump(r)
 @router.put('/claims/{i}')
 def edit_claim(i:int,data:ClaimInput,u=Depends(editor),s=Depends(db)):
  r=s.get(Claim,i)
  if not r:raise HTTPException(404,'报销样本不存在')
- for k,v in data.model_dump().items():setattr(r,k,v)
- try:s.commit()
- except IntegrityError:s.rollback();raise HTTPException(409,'报销编号重复')
- audit(s,u,'修订报销 '+str(i));return dump(r)
+ with claim_lock(i):
+  _apply_ranges(r,data)
+  score,task=rescore_and_route(s,r)
+  try:s.commit()
+  except IntegrityError:s.rollback();raise HTTPException(409,'报销编号重复')
+ routed=(task.kind+'/'+task.state) if task else 'below/暂不派单'
+ audit(s,u,f'修订报销 {r.code} 范围/字段，旧评分失效并重新分流为 {routed}');return dump(r)
 @router.get('/trainings')
 def trainings(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Training).order_by(Training.id.desc()).all()]
 @router.post('/trainings')
@@ -70,5 +87,45 @@ def approve(i:int,u=Depends(admin),s=Depends(db)):
  if not r:raise HTTPException(404,'复核任务不存在')
  if r.decision=='pending' or r.status!='draft':raise HTTPException(409,'先填写人工判断，且只签核一次')
  r.status='approved';s.commit();audit(s,u,'签核复核 '+str(i));return dump(r)
+# ---------------- 范围分流 ----------------
+@router.get('/triage/overview')
+def overview(u=Depends(current),s=Depends(db)):
+ scores=s.query(Score).filter_by(active=True).all();tasks=s.query(TriageTask).filter_by(active=True).all()
+ return {'scores':[dump(x) for x in scores],'tasks':[dump(x) for x in tasks],
+  'evidences':[dump(x) for x in s.query(Evidence).order_by(Evidence.id.desc()).all()]}
+@router.post('/claims/{i}/evidence')
+def evidence(i:int,data:EvidenceInput,u=Depends(editor),s=Depends(db)):
+ claim=s.get(Claim,i)
+ if not claim:raise HTTPException(404,'报销样本不存在')
+ try:
+  with claim_lock(i):
+   ev,score,task=add_evidence(s,claim,data.model_dump(),u);s.commit()
+ except TriageError as e:raise HTTPException(409,str(e))
+ return {'evidence':dump(ev),'score':dump(score),'task':dump(task)}
+@router.post('/triage/tasks/{i}/claim')
+def take(i:int,u=Depends(editor),s=Depends(db)):
+ task=s.get(TriageTask,i)
+ if not task:raise HTTPException(404,'分流任务不存在')
+ try:
+  with claim_lock(task.claim_id):return dump(claim_task(s,i,u))
+ except TriageError as e:raise HTTPException(409,str(e))
+@router.post('/triage/tasks/{i}/complete')
+def finish(i:int,data:CompleteInput,u=Depends(editor),s=Depends(db)):
+ try:return dump(complete_task(s,i,u,data.note))
+ except TriageError as e:raise HTTPException(409,str(e))
+@router.post('/triage/tasks/{i}/retry')
+def retry(i:int,u=Depends(editor),s=Depends(db)):
+ task=s.get(TriageTask,i)
+ if not task:raise HTTPException(404,'分流任务不存在')
+ try:
+  with claim_lock(task.claim_id):return dump(retry_task(s,i,u))
+ except TriageError as e:raise HTTPException(409,str(e))
+@router.post('/triage/rescore')
+def rescore_all(u=Depends(editor),s=Depends(db)):
+ n=0
+ for c in s.query(Claim).order_by(Claim.id).all():
+  with claim_lock(c.id):rescore_and_route(s,c);n+=1
+ s.commit();audit(s,u,f'按最新训练版本重算 {n} 笔范围票据评分并分流')
+ return {'rescored':n}
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]

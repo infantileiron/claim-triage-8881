@@ -3,3 +3,13 @@
 -- trainings: frozen snapshot and holdout output JSON.
 -- reviews: training_id / claim_id foreign keys with unique source pair.
 -- Exact portable schema: src/models/entities.py.
+--
+-- 范围分流扩展（启动时由 src/main.py _migrate 对旧库幂等补列/建表）：
+-- claims 增加 amount_min/amount_max、distance_min/distance_max、range_note；
+--   点值票据上下界相等，范围票据录入业务给定的上下界。
+-- evidences: 新凭证（claim_id + 金额/里程范围 + 录入人/时间）。
+-- scores: 每票的概率上下界评分版本；active+active_key 唯一保证每票仅一个当前评分，
+--   state=pending/scored/failed，band=below/cross/above，basis 冻结有效范围与依据。
+-- triage_tasks: 分流任务 kind=evidence/review，state=queued/claimed/done/cancelled/failed；
+--   active+active_key 唯一保证同一票不会被补证侧与复核侧重复领走；
+--   领取用条件 UPDATE 原子完成，失败重试不重复派单。
